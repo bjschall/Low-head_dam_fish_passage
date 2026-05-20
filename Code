@@ -1,0 +1,598 @@
+library(lubridate)
+library(tidyverse)
+library(writexl)
+library(readr)
+library(readxl)
+library(dataRetrieval)
+library(brms)
+library(tidybayes)
+library(ggh4x)
+
+##Data for analysis
+load("Low-head_Environ.Rdata")
+
+#
+df <- analysis_df %>% 
+  mutate(Date = as.Date(format(mdy(Date), "%Y/%m/%d")))
+
+#Summary
+df %>% 
+  group_by(Species) %>% 
+  summarize(n=sum(Attempt), success=sum(Success))
+
+#James River Gage Height Info
+siteNo <- "06478513"  
+#06478500 is Scotland; 06478000 is Mitchell; 06467500 is Missouri River below Gavins;
+#06480000 Brookings; 06481000 Akron; 06482020 Sioux Falls N. Cliff; 06478513 Yankton
+pCode <- "00065"
+start.date <- "2020-01-01"
+end.date <- "2025-12-31"
+
+#######GH Daily Values######
+GHdv <- readNWISdv(siteNumbers = siteNo,
+                          parameterCd = pCode,
+                          startDate = start.date,
+                          endDate = end.date)
+GHdv<-renameNWISColumns(GHdv) %>% 
+  mutate(GH_m = GH*0.3048)
+
+
+#Combining datasets
+df2<-left_join(df, GHdv, by="Date")
+
+
+#Add one gage height value 
+df2 <- df2 %>%
+  mutate(GH_m = if_else(ShortID == "28124", 0.694944, GH_m))
+
+#Temperature data
+temps %>% filter(Location=="Hwy50_WLL") %>% 
+  ggplot(aes(x=as.Date(Date), y=TempF_mod, col=Location)) + geom_line()
+  
+
+t2<-temps %>% filter(Location=="Hwy50_WLL") %>% 
+  select(Date, TempF_mod) %>% 
+  mutate(Date=as.Date(Date), 
+         TempC = (TempF_mod-32)*5/9) %>% 
+  group_by(Date) %>% 
+  summarize(MeanTemp= mean(TempC))
+
+df.3 <- left_join(df2, t2, by="Date") 
+  
+###Use Missouri River Temperatures to predict James temps for 2021
+MO_temps2 <- MO_temps %>% 
+  group_by(Date) %>% 
+  summarize(MeanTempF = mean(Yankton, na.rm=T))%>% 
+  mutate(TmeanC_MO = (MeanTempF-32)*5/9)
+
+#join MO River and James River temperature data into one file
+temps3 <- left_join(t2, MO_temps2, by="Date") %>% mutate(Year=year(Date))
+
+#Temperature model
+MO_Temp_mod<-brm(MeanTemp ~ TmeanC_MO, 
+              data=temps3 %>% filter(Year==2021),
+              family = gaussian(),
+              file="MO_Temp_model.rds",
+              save_pars = save_pars(all = TRUE),
+              file_refit = "on_change",
+              chains=4, iter=5000, cores=4)
+
+
+print(MO_Temp_mod, digits=3)
+bayes_R2(MO_Temp_mod)
+pp_check(MO_Temp_mod)
+
+#identify dates with missing James River temps 
+Dates <- df.3 %>% filter(Species=="Blue Sucker"&is.na(MeanTemp)) %>% ungroup() %>% distinct(Date) 
+TmeanC_MO <- MO_temps2 %>% 
+  mutate(Date=as.Date(Date)) %>% 
+  filter(Date %in% Dates$Date)
+
+#Sample posterior for magnitude of difference
+posts <- add_epred_draws(MO_Temp_mod, newdata = TmeanC_MO %>% select(TmeanC_MO))
+posts2 <- posts %>% group_by(TmeanC_MO) %>% mean_qi(.epred) %>% left_join(TmeanC_MO); posts2
+
+#add mean estimates to final dataframe
+df.final <- df.3 %>%
+  left_join(posts2 %>% select(Date, .epred), by = "Date") %>%
+  mutate(MeanTemp = if_else(is.na(MeanTemp), .epred, MeanTemp)) %>%
+  select(-.epred) %>% 
+  group_by(Species) %>% 
+  mutate(
+    gage_z   = as.numeric(scale(GH_m)),
+    temp_z   = as.numeric(scale(MeanTemp)),
+    length_z = as.numeric(scale(Length))
+  )
+
+#########################################################################################
+#Modeling 
+#########################################################################################
+#Determine the necessary priors
+get_prior(Success|trials(Attempt)~1, 
+          data=df.final,
+          family = binomial(link="logit"))
+
+#Priors - weakly informative 
+priors <- c(
+  prior(normal(0, 2), class = "b"),        
+  prior(normal(0, 2), class = "Intercept"),
+  prior(exponential(1), class = "sd")      
+)
+
+#### Blue Sucker ####
+########  null model
+null_mod<-brm(Success ~ 1 + (1|Year) + (1|ShortID), 
+              data=df.final %>% filter(Species=="Blue Sucker"),
+              family = bernoulli(link="logit"),
+              prior = c(
+                prior(normal(0, 2), class = "Intercept"),
+                prior(exponential(1), class = "sd")),
+              file="BS.Null_model.rds",
+              save_pars = save_pars(all = TRUE),
+              file_refit = "on_change",
+              chains=4, iter=5000, cores=4)
+
+print(null_mod, digits=4)
+plot(null_mod)
+pp_check(null_mod, ndraws =30)
+bayes_R2(null_mod)
+
+#Gage height model 
+gage_mod <- brm(
+  Success ~ gage_z + (1 | Year) + (1 | ShortID),
+  data = df.final %>% filter(Species == "Blue Sucker"),
+  family = bernoulli(),
+  prior = priors,
+  file = "BS.gage_model.rds",
+  save_pars = save_pars(all = TRUE),
+  control = list(adapt_delta = 0.99),
+  file_refit = "on_change",
+  chains = 4, iter = 5000, cores = 4
+)
+
+print(gage_mod, digits=3)
+plot(gage_mod)
+pp_check(gage_mod, ndraws =30)
+bayes_R2(gage_mod)
+
+#Temperature model 
+temp_mod <- brm(
+  Success ~ temp_z + (1 | Year) + (1 | ShortID),
+  data = df.final %>% filter(Species == "Blue Sucker"),
+  family = bernoulli(),
+  prior = priors,
+  file = "BS.temp_model.rds",
+  save_pars = save_pars(all = TRUE),
+  control = list(adapt_delta = 0.99),
+  file_refit = "on_change",
+  chains = 4, iter = 5000, cores = 4
+)
+
+print(temp_mod, digits=3)
+plot(temp_mod)
+pp_check(temp_mod, ndraws =30)
+bayes_R2(temp_mod)
+
+#Length model
+length_mod <- brm(
+  Success ~ length_z + (1 | Year) + (1 | ShortID),
+  data = df.final %>% filter(Species == "Blue Sucker"),
+  family = bernoulli(),
+  prior = priors,
+  file = "BS.length_model.rds",
+  save_pars = save_pars(all = TRUE),
+  control = list(adapt_delta = 0.99),
+  file_refit = "on_change",
+  chains = 4, iter = 5000, cores = 4
+)
+
+print(length_mod, digits=3)
+plot(length_mod)
+pp_check(length_mod, ndraws =30)
+bayes_R2(length_mod)
+
+#Gage + length
+gage_length_mod <- brm(
+  Success ~ gage_z + length_z + (1 | Year) + (1 | ShortID),
+  data = df.final %>% filter(Species == "Blue Sucker"),
+  family = bernoulli(),
+  prior = priors,
+  file = "BS.gage_length_model.rds",
+  save_pars = save_pars(all = TRUE),
+  control = list(adapt_delta = 0.99),
+  file_refit = "on_change",
+  chains = 4, iter = 5000, cores = 4
+)
+
+print(gage_length_mod, digits=3)
+plot(gage_length_mod)
+pp_check(gage_length_mod, ndraws =30)
+bayes_R2(gage_length_mod)
+
+#Gage + temperature 
+gage_temp_mod <- brm(
+  Success ~ gage_z + temp_z + (1 | Year) + (1 | ShortID),
+  data = df.final %>% filter(Species == "Blue Sucker"),
+  family = bernoulli(),
+  prior = priors,
+  file = "BS.gage_temp_model.rds",
+  save_pars = save_pars(all = TRUE),
+  control = list(adapt_delta = 0.99),
+  file_refit = "on_change",
+  chains = 4, iter = 5000, cores = 4
+)
+
+print(gage_temp_mod, digits=4)
+plot(gage_temp_mod)
+pp_check(gage_temp_mod, ndraws =30)
+bayes_R2(gage_temp_mod)
+
+#Length + temperature 
+length_temp_mod <- brm(
+  Success ~ length_z + temp_z + (1 | Year) + (1 | ShortID),
+  data = df.final %>% filter(Species == "Blue Sucker"),
+  family = bernoulli(),
+  prior = priors,
+  file = "BS.length_temp_model.rds",
+  save_pars = save_pars(all = TRUE),
+  control = list(adapt_delta = 0.99),
+  file_refit = "on_change",
+  chains = 4, iter = 5000, cores = 4
+)
+
+print(length_temp_mod, digits=3)
+plot(length_temp_mod)
+pp_check(length_temp_mod, ndraws =30)
+bayes_R2(length_temp_mod)
+
+#Global model 
+global_mod <- brm(
+  Success ~ gage_z + temp_z + length_z + 
+    (1 | Year) + (1 | ShortID),
+  data = df.final %>% filter(Species == "Blue Sucker"),
+  family = bernoulli(),
+  prior = priors,
+  file = "BS.global_model.rds",
+  save_pars = save_pars(all = TRUE),
+  control = list(adapt_delta = 0.99),
+  file_refit = "on_change",
+  chains = 4, iter = 5000, cores = 4
+)
+
+print(global_mod, digits=3)
+plot(global_mod)
+pp_check(global_mod, ndraws =30)
+bayes_R2(global_mod)
+
+#Model comparison using LOO
+loo_compare(
+  loo(null_mod, moment_match = TRUE),
+  loo(gage_mod, moment_match = TRUE),
+  loo(temp_mod, moment_match = TRUE),
+  loo(length_mod, moment_match = TRUE),
+  loo(gage_length_mod, moment_match = TRUE),
+  loo(gage_temp_mod, moment_match = TRUE, reloo=TRUE),
+  loo(length_temp_mod, moment_match = TRUE),
+  loo(global_mod, moment_match = TRUE)
+)
+
+#Top model 
+#Positive slope parameters?
+sum((as_draws_df(gage_temp_mod)$b_gage_z)>0)/10000
+sum((as_draws_df(gage_temp_mod)$b_temp_z)>0)/10000
+
+conditional_effects(gage_temp_mod)
+
+####sample from posterior
+#gage
+sim_bsr_gage <- tibble(gage_z = c(seq(min(filter(df.final, Species == "Blue Sucker")$gage_z), max(filter(df.final, Species == "Blue Sucker")$gage_z), length.out = 99),0), 
+                       temp_z = 0)
+
+draws_bsr_gage<-add_epred_draws(newdata = sim_bsr_gage, 
+                           gage_temp_mod, 
+                           re_formula = NA, 
+                           allow_new_levels=T) 
+
+gage_bsr <- draws_bsr_gage %>% 
+  group_by(gage_z) %>% 
+  mean_qi(.epred) %>% 
+  mutate(facet="Gage height (m)",
+         variable_z_scaled = gage_z*sd(filter(df.final, Species == "Blue Sucker")$GH_m)+mean(filter(df.final, Species == "Blue Sucker")$GH_m))%>% 
+  rename(variable_z = gage_z) %>% 
+  select(-.width, -.point, -.interval); gage_bsr
+
+#temperature
+sim_bsr_temp <- tibble(gage_z = 0,
+                       temp_z = c(seq(min(filter(df.final, Species == "Blue Sucker")$temp_z), max(filter(df.final, Species == "Blue Sucker")$temp_z), length.out = 99),0))
+
+
+draws_bsr_temp<-add_epred_draws(newdata = sim_bsr_temp, 
+                           gage_temp_mod, 
+                           re_formula = NA, 
+                           allow_new_levels=T) 
+
+temp_bsr <- draws_bsr_temp %>% 
+  filter(gage_z==0) %>% 
+  group_by(temp_z) %>% 
+  mean_qi(.epred)%>% 
+  mutate(facet="Temperature (°C)", 
+         variable_z_scaled = temp_z*sd(filter(df.final, Species == "Blue Sucker")$MeanTemp)+mean(filter(df.final, Species == "Blue Sucker")$MeanTemp)) %>% 
+  rename(variable_z = temp_z)%>% 
+  select(-.width, -.point, -.interval); temp_bsr
+
+#join posterior means
+df_joined_bsr <- full_join(gage_bsr, temp_bsr) 
+
+#plot
+df_joined_bsr %>% ggplot(aes(x=variable_z_scaled, y=.epred))+
+  geom_line()+
+  geom_ribbon(aes(ymin=.lower, ymax=.upper), alpha=0.2)+
+  facet_wrap(~facet, scales="free")+
+  scale_x_continuous(n.breaks = 4)+
+  ylab("Probability of passage")+
+  xlab("")+
+  theme_classic()+
+  facetted_pos_scales(
+    x = list(
+      facet == "Gage height (m)" ~ scale_x_continuous(breaks = c(1:4)),
+      facet == "Temperature (°C)" ~ scale_x_continuous(breaks = c(5,10,15,20,25))),
+    y = list(
+      facet == "Gage height (m)" ~ scale_y_continuous(limits = c(0,1)),
+      facet == "Temperature (°C)" ~ scale_y_continuous(limits = c(0,1))))+
+  theme(axis.text=element_text(size=12), 
+        axis.title=element_text(size=16), 
+        strip.text=element_text(size=14))
+
+ggsave("Figure5_BSR_TopModel.jpeg", height=5, width=8, units="in")
+
+#######################################################################################################################
+#### Silver Carp Models ####
+null_mod_svc<-brm(Success ~ 1 + (1|Year) + (1|ShortID), 
+              data=df.final %>% filter(Species=="Silver Carp"),
+              family = bernoulli(link="logit"),
+              prior = c(
+                prior(normal(0, 2), class = "Intercept"),
+                prior(exponential(1), class = "sd")),
+              file="SC.Null_model.rds",
+              save_pars = save_pars(all = TRUE),
+              control = list(adapt_delta = 0.99),
+              file_refit = "on_change",
+              chains=4, iter=4000, cores=4)
+
+print(null_mod_svc, digits=4)
+plot(null_mod_svc)
+pp_check(null_mod_svc, ndraws =30)
+bayes_R2(null_mod_svc)
+
+#Gage height model 
+gage_mod_svc <- brm(
+  Success ~ gage_z + (1 | Year) + (1 | ShortID),
+  data = df.final %>% filter(Species == "Silver Carp"),
+  family = bernoulli(),
+  prior = priors,
+  file = "SC.gage_model.rds",
+  save_pars = save_pars(all = TRUE),
+  control = list(adapt_delta = 0.99),
+  file_refit = "on_change",
+  chains = 4, iter = 5000, cores = 4
+)
+
+print(gage_mod_svc, digits=3)
+plot(gage_mod_svc)
+pp_check(gage_mod_svc, ndraws =30)
+bayes_R2(gage_mod_svc)
+
+#Temperature model 
+temp_mod_svc <- brm(
+  Success ~ temp_z + (1 | Year) + (1 | ShortID),
+  data = df.final %>% filter(Species == "Silver Carp"),
+  family = bernoulli(),
+  prior = priors,
+  file = "SC.temp_model.rds",
+  save_pars = save_pars(all = TRUE),
+  control = list(adapt_delta = 0.99),
+  file_refit = "on_change",
+  chains = 4, iter = 5000, cores = 4
+)
+
+print(temp_mod_svc, digits=3)
+plot(temp_mod_svc)
+pp_check(temp_mod_svc, ndraws =30)
+bayes_R2(temp_mod_svc)
+
+#Length model
+length_mod_svc <- brm(
+  Success ~ length_z + (1 | Year) + (1 | ShortID),
+  data = df.final %>% filter(Species == "Silver Carp"),
+  family = bernoulli(),
+  prior = priors,
+  file = "SC.length_model.rds",
+  save_pars = save_pars(all = TRUE),
+  control = list(adapt_delta = 0.99),
+  file_refit = "on_change",
+  chains = 4, iter = 5000, cores = 4
+)
+
+print(length_mod_svc, digits=3)
+plot(length_mod_svc)
+pp_check(length_mod_svc, ndraws =30)
+bayes_R2(length_mod_svc)
+
+#Gage + length
+gage_length_mod_svc <- brm(
+  Success ~ gage_z + length_z + (1 | Year) + (1 | ShortID),
+  data = df.final %>% filter(Species == "Silver Carp"),
+  family = bernoulli(),
+  prior = priors,
+  file = "SC.gage_length_model.rds",
+  save_pars = save_pars(all = TRUE),
+  control = list(adapt_delta = 0.99),
+  file_refit = "on_change",
+  chains = 4, iter = 5000, cores = 4
+)
+
+print(gage_length_mod_svc, digits=3)
+plot(gage_length_mod_svc)
+pp_check(gage_length_mod_svc, ndraws =30)
+bayes_R2(gage_length_mod_svc)
+
+#Gage + temperature 
+gage_temp_mod_svc <- brm(
+  Success ~ gage_z + temp_z + (1 | Year) + (1 | ShortID),
+  data = df.final %>% filter(Species == "Silver Carp"),
+  family = bernoulli(),
+  prior = priors,
+  file = "SC.gage_temp_model.rds",
+  save_pars = save_pars(all = TRUE),
+  control = list(adapt_delta = 0.99),
+  file_refit = "on_change",
+  chains = 4, iter = 5000, cores = 4
+)
+
+print(gage_temp_mod_svc, digits=3)
+plot(gage_temp_mod_svc)
+pp_check(gage_temp_mod_svc, ndraws =30)
+bayes_R2(gage_temp_mod_svc)
+
+#Length + temperature 
+length_temp_mod_svc <- brm(
+  Success ~ length_z + temp_z + (1 | Year) + (1 | ShortID),
+  data = df.final %>% filter(Species == "Silver Carp"),
+  family = bernoulli(),
+  prior = priors,
+  file = "SC.length_temp_model.rds",
+  save_pars = save_pars(all = TRUE),
+  control = list(adapt_delta = 0.99),
+  file_refit = "on_change",
+  chains = 4, iter = 5000, cores = 4
+)
+
+print(length_temp_mod_svc, digits=3)
+plot(length_temp_mod_svc)
+pp_check(length_temp_mod_svc, ndraws =30)
+bayes_R2(length_temp_mod_svc)
+
+#Global model 
+global_mod_svc <- brm(
+  Success ~ gage_z + temp_z + length_z + 
+    (1 | Year) + (1 | ShortID),
+  data = df.final %>% filter(Species == "Silver Carp"),
+  family = bernoulli(),
+  prior = priors,
+  file = "SC.global_model.rds",
+  save_pars = save_pars(all = TRUE),
+  control = list(adapt_delta = 0.99),
+  file_refit = "on_change",
+  chains = 4, iter = 5000, cores = 4
+)
+
+print(global_mod_svc, digits=4)
+plot(global_mod_svc)
+pp_check(global_mod_svc, ndraws =30)
+bayes_R2(global_mod_svc)
+
+#Model comparison using LOO
+loo_compare(
+  loo(null_mod_svc, moment_match = T),
+  loo(gage_mod_svc, moment_match = T),
+  loo(temp_mod_svc, moment_match = T),
+  loo(length_mod_svc, moment_match = T),
+  loo(gage_length_mod_svc, moment_match = T),
+  loo(gage_temp_mod_svc, moment_match = T),
+  loo(length_temp_mod_svc, moment_match = T),
+  loo(global_mod_svc, moment_match = T)
+)
+
+conditional_effects(global_mod_svc, re_formula=NA)
+bayes_R2(global_mod_svc)
+bayes_R2(gage_temp_mod_svc)
+
+#Top model - Silver Carp
+#Probability slope is positive?
+sum((as_draws_df(global_mod_svc)$b_gage_z)>0)/10000
+sum((as_draws_df(global_mod_svc)$b_temp_z)>0)/10000
+sum((as_draws_df(global_mod_svc)$b_length_z)>0)/10000
+
+####sample from posterior
+#gage
+sim_svc_gage <- tibble(gage_z = c(seq(min(filter(df.final, Species == "Silver Carp")$gage_z), max(filter(df.final, Species == "Silver Carp")$gage_z), length.out = 99),0), 
+                  temp_z = 0,
+                  length_z = 0)
+
+draws_svc_gage<-add_epred_draws(newdata = sim_svc_gage, 
+                                global_mod_svc, 
+                                re_formula = NA, 
+                                allow_new_levels=T) 
+
+gage_svc <- draws_svc_gage %>% 
+  group_by(gage_z) %>% 
+  mean_qi(.epred) %>% 
+  mutate(facet="Gage height (m)", 
+         variable_z_scaled = gage_z*sd(filter(df.final, Species == "Silver Carp")$GH_m)+mean(filter(df.final, Species == "Silver Carp")$GH_m)) %>% 
+  rename(variable_z = gage_z)%>% 
+  select(-.width, -.point, -.interval); gage_svc
+
+#temp
+sim_svc_temp <- tibble(gage_z = 0, 
+                       temp_z = c(seq(min(filter(df.final, Species == "Silver Carp")$temp_z), max(filter(df.final, Species == "Silver Carp")$temp_z), length.out = 99),0),
+                       length_z = 0)
+
+draws_svc_temp<-add_epred_draws(newdata = sim_svc_temp, 
+                                global_mod_svc, 
+                                re_formula = NA, 
+                                allow_new_levels=T) 
+
+temp_svc <- draws_svc_temp %>% 
+  group_by(temp_z) %>% 
+  mean_qi(.epred)%>% 
+  mutate(facet="Temperature (°C)", 
+         variable_z_scaled = temp_z*sd(filter(df.final, Species == "Silver Carp")$MeanTemp)+mean(filter(df.final, Species == "Silver Carp")$MeanTemp)) %>% 
+  rename(variable_z = temp_z)%>% 
+  select(-.width, -.point, -.interval); temp_svc
+
+#length
+sim_svc_length <- tibble(gage_z = 0, 
+                       temp_z = 0,
+                       length_z = c(seq(min(filter(df.final, Species == "Silver Carp")$length_z), max(filter(df.final, Species == "Silver Carp")$length_z), length.out = 99),0))
+
+draws_svc_length<-add_epred_draws(newdata = sim_svc_length, 
+                                  global_mod_svc, 
+                                  re_formula = NA, 
+                                  allow_new_levels=T) 
+
+length_svc <- draws_svc_length %>% 
+  group_by(length_z) %>% 
+  mean_qi(.epred)%>% 
+  mutate(facet="Total length (mm)", 
+         variable_z_scaled = length_z*sd(filter(df.final, Species == "Silver Carp")$Length)+mean(filter(df.final, Species == "Silver Carp")$Length)) %>% 
+  rename(variable_z = length_z) %>% 
+  select(-.width, -.point, -.interval); length_svc
+
+#join posterior dataframes
+df_joined_svc <- gage_svc %>%
+  full_join(temp_svc) %>%
+  full_join(length_svc)
+
+#plot
+df_joined_svc %>% ggplot(aes(x=variable_z_scaled, y=.epred))+
+  geom_line()+
+  geom_ribbon(aes(ymin=.lower, ymax=.upper), alpha=0.2)+
+  facet_wrap(~facet, scales="free")+
+  scale_x_continuous(n.breaks = 4)+
+  ylab("Probability of passage")+
+  xlab("")+
+  theme_classic()+
+  facetted_pos_scales(
+    x = list(
+      facet == "Gage height (m)" ~ scale_x_continuous(breaks = c(1:6)),
+      facet == "Temperature (°C)" ~ scale_x_continuous(breaks = c(5,10,15,20,25,30)),
+      facet == "Total length (mm)" ~ scale_x_continuous(breaks = seq(500,750,100))),
+    y = list(
+      facet == "Gage height (m)" ~ scale_y_continuous(limits = c(0,1)),
+      facet == "Temperature (°C)" ~ scale_y_continuous(limits = c(0,1)),
+      facet == "Total length (mm)" ~ scale_y_continuous(limits = c(0,1))))+
+  theme(axis.text=element_text(size=12), 
+        axis.title=element_text(size=16), 
+        strip.text=element_text(size=14))
+
+ggsave("Figure6_SVC_TopModel.jpeg", height=5, width=8, units="in")
